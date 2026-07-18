@@ -16,6 +16,16 @@ Mochi — a living chibi cat for your Windows taskbar.
   Drop files/folders on him and he munches them into the Recycle Bin.
 - Perching: he hops onto the top edge of your windows, rides them around,
   and naps up there; hops down by himself (or when you feed/play).
+- Sounds: real CC0 cat recordings in sounds/ (see CREDITS.txt) — a purr that
+  swells while you pet him and trails off after, chirps at butterflies, a
+  meow when you come back; variants picked at random with volume jitter so
+  he never repeats himself exactly. Mute in the menu. If the WAVs are
+  deleted, stand-in sounds are synthesized on next launch.
+- Bond: slow trust stat only interaction raises; unlocks perching on your
+  active window, rarer gift kinds, and a tray "Call" he actually obeys.
+- Power discipline: drops to ~12 fps while he sleeps/loafs undisturbed.
+  He never auto-hides — he is always on top, over the taskbar, no exceptions
+  (a self-healing check repairs Win11's silent topmost breakage).
 
 Run:        double-click pet.pyw (pythonw, no console window)
 Snapshot:   python pet.pyw --snapshot out.png    (render pose grid, no GUI)
@@ -35,15 +45,21 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, QUrl
 from PySide6.QtGui import (QAction, QBrush, QColor, QCursor, QFont, QIcon,
                            QPainter, QPainterPath, QPen, QPixmap, QImage,
                            QRegion)
 from PySide6.QtWidgets import (QApplication, QMenu, QSystemTrayIcon, QWidget,
                                QInputDialog)
 
+try:
+    from PySide6.QtMultimedia import QSoundEffect
+except ImportError:
+    QSoundEffect = None
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SAVE_PATH = os.path.join(APP_DIR, "cat_state.json")
+SOUND_DIR = os.path.join(APP_DIR, "sounds")
 
 FUR        = QColor("#A1978C")
 FUR_LIGHT  = QColor("#C2B9AE")
@@ -80,6 +96,8 @@ FOOD_COLORS = {
     "Milk":   QColor("#F5F2EC"),
 }
 
+SOUND_VOL = {"purr": 0.40, "chirp": 0.50, "meow": 0.50}
+
 
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
@@ -110,6 +128,8 @@ class PetState:
     size: float = 0.85
     gifts: int = 0
     files_eaten: int = 0
+    bond: float = 12.0       # 0..100 trust; only interaction raises it
+    muted: bool = False
     playful: float = 0.6
     needy: float = 0.5
     lazy: float = 0.5
@@ -158,6 +178,7 @@ class PetState:
         self.clean = max(min(self.clean, 35.0), self.clean - 0.8 * h)
         self.energy = clamp(self.energy + 12.0 * h, 0, 100)
         self.weight = clamp(self.weight - 0.002 * h, 0.85, 1.30)
+        self.bond = clamp(self.bond - 0.4 * h / 24.0, 0, 100)
         return hours
 
     @property
@@ -251,14 +272,15 @@ class EmotionEngine:
 
 
 IDLE_SIT, LOAF, SLEEP, WALK, GROOM, WATCH, BEG, ZOOMIES, EAT, PLAY, \
-    DRAGGED, FALLING, GIFT, STRETCH, CHASE, GO_PERCH, HOP_DOWN = range(17)
+    DRAGGED, FALLING, GIFT, STRETCH, CHASE, GO_PERCH, HOP_DOWN, \
+    CALLED = range(18)
 
 POSE_OF_ACTION = {
     IDLE_SIT: "sit", LOAF: "loaf", SLEEP: "curl", WALK: "walk",
     GROOM: "groom", WATCH: "sit", BEG: "beg", ZOOMIES: "walk",
     EAT: "eat", PLAY: "walk", DRAGGED: "drag", FALLING: "drag",
     GIFT: "walk", STRETCH: "stretch", CHASE: "walk",
-    GO_PERCH: "walk", HOP_DOWN: "walk",
+    GO_PERCH: "walk", HOP_DOWN: "walk", CALLED: "walk",
 }
 
 
@@ -286,8 +308,9 @@ def tick_needs(st: PetState, dt: float, action: int):
     else:
         cost = 14.0 if action == ZOOMIES else \
             9.0 if action == CHASE else \
-            6.0 if action in (WALK, PLAY, GO_PERCH) else 3.2
+            6.0 if action in (WALK, PLAY, GO_PERCH, CALLED) else 3.2
         st.energy = clamp(st.energy - dt / 3600 * cost, 0, 100)
+    st.bond = clamp(st.bond - dt / 86400.0, 0, 100)   # trust fades ~1/day
 
 
 class Brain:
@@ -322,7 +345,7 @@ class Brain:
     def choose(self, hour: float, cursor_active: bool, cursor_near: bool):
         st, emo = self.st, self.emo
         if self.action in (DRAGGED, FALLING, EAT, PLAY, GIFT,
-                           GO_PERCH, HOP_DOWN):
+                           GO_PERCH, HOP_DOWN, CALLED):
             return self.action
         if self.action_t < self.min_dur:
             return self.action
@@ -352,7 +375,8 @@ class Brain:
                 and self.rng.random() < 0.06):
             u[ZOOMIES] = 2.5
         if (st.social > 70 and emo.valence > 0.35 and st.gifts < 99
-                and not self.on_perch and self.rng.random() < 0.010):
+                and not self.on_perch
+                and self.rng.random() < 0.004 + 0.012 * st.bond / 100.0):
             u[GIFT] = 2.2
         if self.chase_x is not None and st.energy > 25 and not self.on_perch:
             u[CHASE] = 0.9 + 0.9 * st.playful + 0.4 * max(0.0, emo.arousal)
@@ -384,7 +408,8 @@ class Brain:
                 ZOOMIES: (4, 7), EAT: (900, 900), PLAY: (900, 900),
                 DRAGGED: (900, 900), FALLING: (900, 900), GIFT: (900, 900),
                 STRETCH: (2.0, 3.2), CHASE: (3, 6),
-                GO_PERCH: (900, 900), HOP_DOWN: (900, 900)}
+                GO_PERCH: (900, 900), HOP_DOWN: (900, 900),
+                CALLED: (900, 900)}
         lo, hi = durs.get(a, (4, 9))
         self.min_dur = min_dur if min_dur is not None else self.rng.uniform(lo, hi)
 
@@ -1053,6 +1078,91 @@ def draw_sparkle(p: QPainter, x, y, s, color):
     p.drawPath(path)
 
 
+def _write_wav(path, samples, sr=22050):
+    import struct
+    import wave
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(b"".join(
+            struct.pack("<h", int(clamp(s, -1.0, 1.0) * 32767))
+            for s in samples))
+
+
+def _gen_purr(sr):
+    """Purr as a rolled low trill: harmonics of the 24 Hz purr rate
+    (48/96/144/192 Hz — audible on laptop speakers, unlike the real ~25 Hz
+    fundamental) amplitude-rolled at 24 Hz, plus a whisper of triple-lowpassed
+    breath noise. Chopping broadband noise instead IS the helicopter sound.
+    All periodic parts fit the 1.5 s loop exactly; the noise seam is
+    crossfaded tail-into-head so infinite looping is seamless."""
+    rng = random.Random(3)
+    n, fade = int(sr * 1.5), int(sr * 0.05)
+    lp1 = lp2 = lp3 = 0.0
+    raw = []
+    for i in range(n + fade):
+        t = i / sr
+        roll = 0.62 + 0.38 * math.sin(2 * math.pi * 24 * t)
+        breath = 0.80 + 0.20 * math.sin(2 * math.pi * t / 0.75)
+        rumble = (0.45 * math.sin(2 * math.pi * 48 * t)
+                  + math.sin(2 * math.pi * 96 * t)
+                  + 0.45 * math.sin(2 * math.pi * 144 * t)
+                  + 0.18 * math.sin(2 * math.pi * 192 * t))
+        lp1 += 0.055 * (rng.uniform(-1, 1) - lp1)
+        lp2 += 0.055 * (lp1 - lp2)
+        lp3 += 0.055 * (lp2 - lp3)
+        noise = lp3 * 6.0 * (0.75 + 0.25 * math.sin(2 * math.pi * 24 * t))
+        raw.append((0.30 * rumble * roll + 0.10 * noise) * breath)
+    for i in range(fade):
+        k = i / fade
+        raw[i] = raw[i] * k + raw[n + i] * (1 - k)
+    return raw[:n]
+
+
+def _gen_chirp(sr):
+    """Quick rising trill — the little 'brrp?' at a butterfly."""
+    dur = 0.32
+    out, phase = [], 0.0
+    for i in range(int(sr * dur)):
+        t = i / sr
+        f = 620 + 900 * t / dur + 140 * math.sin(2 * math.pi * 27 * t)
+        phase += 2 * math.pi * f / sr
+        env = math.sin(math.pi * t / dur) ** 0.7
+        out.append((math.sin(phase) + 0.35 * math.sin(2 * phase)) * env * 0.5)
+    return out
+
+
+def _gen_meow(sr):
+    """One soft greeting meow: pitch rises then falls, brightness fades
+    across the vowel so it reads 'mee-ow' rather than a beep."""
+    dur = 0.55
+    out, phase = [], 0.0
+    for i in range(int(sr * dur)):
+        t = i / sr
+        x = t / dur
+        f = 430 + 320 * math.sin(math.pi * min(x * 1.15, 1.0))
+        phase += 2 * math.pi * f / sr
+        bright = 0.15 + 0.55 * (1 - x)
+        env = clamp(x / 0.08, 0, 1) * clamp((1 - x) / 0.25, 0, 1)
+        out.append((math.sin(phase) + bright * math.sin(2 * phase)
+                    + 0.3 * bright * math.sin(3 * phase)) * env * 0.42)
+    return out
+
+
+def ensure_sounds() -> dict:
+    """Synthesize the three WAVs into sounds/ if missing; returns paths."""
+    os.makedirs(SOUND_DIR, exist_ok=True)
+    paths = {}
+    for name, gen in (("purr", _gen_purr), ("chirp", _gen_chirp),
+                      ("meow", _gen_meow)):
+        path = os.path.join(SOUND_DIR, name + ".wav")
+        if not os.path.exists(path):
+            _write_wav(path, gen(22050))
+        paths[name] = path
+    return paths
+
+
 def recycle(paths: list[str]) -> bool:
     class SHFILEOPSTRUCTW(ctypes.Structure):
         _fields_ = [("hwnd", ctypes.c_void_p),
@@ -1106,13 +1216,18 @@ def _hwnd_alive(hwnd):
         return False
 
 
-def find_perch(geo, taskbar_y, dpr, exclude_hwnd):
+def find_perch(geo, taskbar_y, dpr, exclude_hwnd, allow_fg=True):
     """Best window ledge right now: the foreground window if suitable,
-    else the top-most suitable one. Returns dict or None."""
+    else the top-most suitable one. Returns dict or None. allow_fg=False
+    keeps the window you're using off-limits — napping on your active
+    window is a privilege he earns at high bond."""
     u = ctypes.windll.user32
+    fg = u.GetForegroundWindow()
 
     def consider(hwnd):
         if not hwnd or hwnd == exclude_hwnd or not _hwnd_alive(hwnd):
+            return None
+        if not allow_fg and hwnd == fg:
             return None
         if u.GetWindowTextLengthW(ctypes.wintypes.HWND(hwnd)) == 0:
             return None
@@ -1128,7 +1243,7 @@ def find_perch(geo, taskbar_y, dpr, exclude_hwnd):
         return {"hwnd": hwnd, "left": left, "right": right, "top": top,
                 "lo": lo, "hi": hi}
 
-    best = consider(u.GetForegroundWindow())
+    best = consider(fg) if allow_fg else None
     if best:
         return best
     found = []
@@ -1224,6 +1339,34 @@ class CatWidget(QWidget):
         self._drool = False
         self._moved = False
         self._walk_phase = 0.0
+        self._breath_phase = 0.0
+        self._tray_emo = None
+        self.call_x = None
+
+        # sounds/{name}*.wav are variants of one sound (meow.wav, meow2.wav…);
+        # _play picks one at random so he never repeats himself exactly
+        self.sounds = {}
+        self._purr_level = 0.0
+        if QSoundEffect is not None:
+            try:
+                ensure_sounds()
+                for name in SOUND_VOL:
+                    fx = []
+                    for fn in sorted(os.listdir(SOUND_DIR)):
+                        if fn.startswith(name) and fn.endswith(".wav"):
+                            s = QSoundEffect(self)
+                            s.setSource(QUrl.fromLocalFile(
+                                os.path.join(SOUND_DIR, fn)))
+                            s.setVolume(SOUND_VOL[name])
+                            if name == "purr":
+                                # setLoopCount only takes int; the enum TypeErrors
+                                s.setLoopCount(
+                                    int(QSoundEffect.Loop.Infinite.value))
+                            fx.append(s)
+                    if fx:
+                        self.sounds[name] = fx
+            except Exception:
+                self.sounds = {}
 
         self.taskbar_y = float(self.screen_geo.bottom() + 1)
         self.ground_y = self.taskbar_y
@@ -1268,19 +1411,49 @@ class CatWidget(QWidget):
         else:
             self.clearMask()
 
+    def _covered_by_normal_window(self, u) -> bool:
+        """Probe the point at his belly: if a NON-topmost window of another
+        process is drawn there, Win11 desynced the z-bands — our ex-style
+        still says topmost while the actual order says otherwise, so the
+        flag check alone misses it. Topmost coverers (toasts, menus, other
+        on-top apps) are legitimate and left alone."""
+        pt = ctypes.wintypes.POINT(
+            int((self.x() + self.W / 2) * self._dpr),
+            int((self.y() + self.GROUND - 40) * self._dpr))
+        u.WindowFromPoint.argtypes = [ctypes.wintypes.POINT]
+        u.WindowFromPoint.restype = ctypes.wintypes.HWND
+        u.GetAncestor.restype = ctypes.wintypes.HWND
+        h = u.WindowFromPoint(pt)
+        if not h:
+            return False
+        root = u.GetAncestor(h, 2)               # GA_ROOT
+        if not root or root == int(self.winId()):
+            return False
+        pid = ctypes.wintypes.DWORD()
+        u.GetWindowThreadProcessId(ctypes.wintypes.HWND(root),
+                                   ctypes.byref(pid))
+        if pid.value == os.getpid():
+            return False                          # our own menu / stats popup
+        cloaked = ctypes.c_int(0)
+        ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            ctypes.wintypes.HWND(root), 14,       # DWMWA_CLOAKED
+            ctypes.byref(cloaked), 4)
+        if cloaked.value:
+            return False                          # not actually drawn there
+        return not (u.GetWindowLongW(ctypes.wintypes.HWND(root), -20) & 0x8)
+
+    # NOTE: an auto-hide-during-fullscreen feature lived here briefly and was
+    # removed on purpose: with an auto-hidden taskbar the work area equals the
+    # monitor, so maximized windows, Alt-Tab overlays and shell hosts are
+    # geometrically indistinguishable from real fullscreen apps — the cat
+    # kept vanishing during normal use. He stays visible, always.
+
     def _sys_tick(self):
         now = time.time()
         dt = clamp(now - self._last_sys, 0.2, 5.0)
         self._last_sys = now
         st = self.st
         hour = time.localtime().tm_hour + time.localtime().tm_min / 60.0
-
-        try:
-            ctypes.windll.user32.SetWindowPos(
-                int(self.winId()), -1, 0, 0, 0, 0,
-                0x0010 | 0x0002 | 0x0001)   # NOACTIVATE | NOMOVE | NOSIZE
-        except Exception:
-            pass
 
         geo = QApplication.primaryScreen().availableGeometry()
         self._dpr = QApplication.primaryScreen().devicePixelRatio() or 1.0
@@ -1293,6 +1466,28 @@ class CatWidget(QWidget):
             if not self.dragging:
                 self._place()
 
+        if self.isVisible():
+            try:
+                u = ctypes.windll.user32
+                hwnd = ctypes.wintypes.HWND(int(self.winId()))
+                flags = 0x0010 | 0x0002 | 0x0001  # NOACTIVATE | NOMOVE | NOSIZE
+                # Win11 breaks topmost two ways: it strips WS_EX_TOPMOST
+                # silently, or desyncs the z-bands so the flag still reads
+                # topmost while normal windows sit above us. Both look like
+                # "the cat went behind my windows", both are invisible to a
+                # plain TOPMOST re-assert (a no-op when the flag is set) —
+                # only the demote-then-promote pair repairs them.
+                broken = (not (u.GetWindowLongW(hwnd, -20) & 0x8)
+                          or (not self.dragging
+                              and self._covered_by_normal_window(u)))
+                if broken:
+                    u.SetWindowPos(hwnd, ctypes.wintypes.HWND(-2),
+                                   0, 0, 0, 0, flags)
+                u.SetWindowPos(hwnd, ctypes.wintypes.HWND(-1),
+                               0, 0, 0, 0, flags)
+            except Exception:
+                pass
+
         if self.perch is None and self.air is None and not self.dragging:
             if self.brain.action == GO_PERCH:
                 t = self.perch_target
@@ -1300,7 +1495,8 @@ class CatWidget(QWidget):
                      if t is not None and _hwnd_alive(t["hwnd"]) else None)
                 if r is None:
                     cand = find_perch(self.screen_geo, self.taskbar_y,
-                                      self._dpr, int(self.winId()))
+                                      self._dpr, int(self.winId()),
+                                      allow_fg=st.bond >= 60)
                     if cand is None:
                         self.perch_target = None
                         self.brain.set_action(IDLE_SIT, 2.0)
@@ -1313,7 +1509,8 @@ class CatWidget(QWidget):
                     t["x"] = clamp(t["x"], r[0] + 60, r[2] - 60)
             else:
                 cand = find_perch(self.screen_geo, self.taskbar_y,
-                                  self._dpr, int(self.winId()))
+                                  self._dpr, int(self.winId()),
+                                  allow_fg=st.bond >= 60)
                 self.brain.can_perch = cand is not None
         else:
             self.brain.can_perch = False
@@ -1335,6 +1532,7 @@ class CatWidget(QWidget):
                 st.fun = clamp(st.fun + f, 0, 100)
                 st.weight = clamp(st.weight + wgain * (1.5 if st.hunger > 80 else 1.0), 0.85, 1.30)
                 self.emo.event(0.42 if fav else 0.3, 0.08)
+                self._bond_up(0.8 if fav else 0.5)
                 self.eat_food = None
                 self._bubble("heart", 2.2)
                 self._spawn_hearts(2)
@@ -1343,6 +1541,7 @@ class CatWidget(QWidget):
             self.brain.set_action(IDLE_SIT)
             self.emo.event(0.25, -0.1)
             st.fun = clamp(st.fun + 18, 0, 100)
+            self._bond_up(0.9)
 
         cur = QCursor.pos()
         self.cursor_hist.append((now, cur.x(), cur.y()))
@@ -1361,6 +1560,7 @@ class CatWidget(QWidget):
         if (self.butterfly is None and 7 <= hour <= 20
                 and self.brain.action != SLEEP and not self.dragging
                 and self.perch is None and self.air is None
+                and self.isVisible()
                 and self.rng.random() < 0.0011 * dt):
             bx = clamp(self.world_x + self.rng.uniform(-260, 260),
                        self.screen_geo.left() + 140,
@@ -1371,6 +1571,7 @@ class CatWidget(QWidget):
                               "until": now + self.rng.uniform(18, 35),
                               "fleeing": False,
                               "drift": self.rng.uniform(-14, 14)}
+            self._play("chirp")
         self.brain.chase_x = (self.butterfly["x"]
                               if self.butterfly and self.perch is None else None)
 
@@ -1400,6 +1601,12 @@ class CatWidget(QWidget):
                     self.tray.showMessage(
                         st.name, f"{st.name} {msg}",
                         QSystemTrayIcon.MessageIcon.Information, 4000)
+
+        if self.tray is not None:
+            mood = "sleepy" if self.brain.action == SLEEP else self.emo.emotion()
+            if mood != self._tray_emo:
+                self._tray_emo = mood
+                self.tray.setIcon(make_tray_icon(mood))
 
         st.x = self.world_x
 
@@ -1481,7 +1688,7 @@ class CatWidget(QWidget):
             self.air = {"v": -240.0, "to_y": self.taskbar_y, "scared": False}
 
         speed = 0.0
-        if a in (WALK, PLAY, ZOOMIES, GIFT, CHASE, GO_PERCH) \
+        if a in (WALK, PLAY, ZOOMIES, GIFT, CHASE, GO_PERCH, CALLED) \
                 and not self.dragging:
             if a == WALK:
                 if self.brain.walk_target is None or abs(self.brain.walk_target - self.world_x) < 12:
@@ -1536,6 +1743,18 @@ class CatWidget(QWidget):
                                     "scared": False}
                         self._transition = 1.0
                         speed = 0
+            elif a == CALLED:
+                target = self.call_x if self.call_x is not None else self.world_x
+                speed = 120
+                if abs(target - self.world_x) < 16:
+                    self.call_x = None
+                    st.social = clamp(st.social + 6, 0, 100)
+                    self._bond_up(0.6)
+                    self.emo.event(0.15, 0.1)
+                    self._spawn_hearts(2)
+                    self._bubble("note", 1.8)
+                    self._play("chirp")
+                    self.brain.set_action(IDLE_SIT, 3.0)
             else:
                 target = self.gift_drop_x or self.world_x
                 speed = 85
@@ -1607,7 +1826,12 @@ class CatWidget(QWidget):
         d.pose = pose
         d.dir = self.facing
         d.weight = st.weight
-        d.breath = (self._t * (0.55 if a == SLEEP else 0.9 + 0.5 * max(0, self.emo.arousal))) % 1.0
+        # integrate breath phase by dt — multiplying wall-time by a rate that
+        # drifts with arousal makes the phase (and the head, which rides the
+        # breathing body) jump every frame, worse the longer he's been up
+        b_rate = 0.55 if a == SLEEP else 0.9 + 0.5 * max(0, self.emo.arousal)
+        self._breath_phase = (self._breath_phase + dt * b_rate) % 1.0
+        d.breath = self._breath_phase
         rate = 16 if a == ZOOMIES else 8 if a in (PLAY, CHASE) else 6.2
         if self._moved:
             self._walk_phase += dt * rate
@@ -1753,6 +1977,33 @@ class CatWidget(QWidget):
                                  -self.rng.uniform(25, 70),
                                  0.7, self.rng.uniform(0.7, 1.2)))
 
+        fx = self.sounds.get("purr")
+        if fx:
+            purr = fx[0]
+            target = 1.0 if (self.petting and not self.st.muted) else 0.0
+            # spin up quickly under your hand, trail off slowly after —
+            # a hard stop on mouse-release sounds like a switch, not a cat
+            rate = 2.5 if target > self._purr_level else 0.8
+            self._purr_level = approach(self._purr_level, target, rate, dt)
+            if self._purr_level > 0.02:
+                purr.setVolume(SOUND_VOL["purr"] * self._purr_level)
+                if not purr.isPlaying():
+                    purr.play()
+            elif purr.isPlaying():
+                purr.stop()
+
+        # power discipline: while he sleeps/loafs undisturbed (zzz particles
+        # are slow enough to survive it) or is hidden, ~12 fps is plenty
+        calm = (a in (SLEEP, LOAF) and not self.dragging and not self.petting
+                and self.air is None and self.butterfly is None
+                and self.bubble is None and self.swat_t <= 0
+                and self._transition <= 0
+                and now >= self._cursor_active_until
+                and all(pt.kind == "zzz" for pt in self.particles))
+        want = 80 if calm else 16
+        if self.anim_timer.interval() != want:
+            self.anim_timer.setInterval(want)
+
         self.update()
 
     def _spawn(self, pt: Particle):
@@ -1832,6 +2083,8 @@ class CatWidget(QWidget):
         elif pf is not None:
             self.brain.set_action(IDLE_SIT, 0.5)
             self.feed(pf)
+        elif self.call_x is not None:
+            self.brain.set_action(CALLED)
         elif time.time() < self.play_until:
             self.brain.set_action(PLAY)
         else:
@@ -1840,6 +2093,8 @@ class CatWidget(QWidget):
 
     def _deliver_gift(self):
         kinds = ["leaf", "sock", "bug"]
+        if self.st.bond >= 70:
+            kinds.append("flower")
         self.gift_item = (self.world_x + 40 * self.facing,
                           self.rng.choice(kinds))
         self.gift_drop_x = None
@@ -1878,6 +2133,37 @@ class CatWidget(QWidget):
             return
         self.brain.set_action(PLAY)
 
+    def _bond_up(self, amt: float):
+        self.st.bond = clamp(self.st.bond + amt, 0, 100)
+
+    def _play(self, name: str):
+        fx = self.sounds.get(name)
+        if fx and not self.st.muted and self.isVisible():
+            s = self.rng.choice(fx)
+            s.setVolume(SOUND_VOL[name] * self.rng.uniform(0.80, 1.10))
+            s.play()
+
+    def toggle_mute(self):
+        self.st.muted = not self.st.muted
+
+    def call_over(self):
+        if self.dragging or self.brain.action in (DRAGGED, FALLING, EAT):
+            return
+        if self.st.bond < 40:
+            # he heard you — he just doesn't care enough yet
+            self._bubble("?", 2.2)
+            self.d.ear_twitch = 1.0
+            self.d.ear_twitch_side = self.rng.choice((-1, 1))
+            return
+        self.call_x = clamp(QCursor.pos().x(),
+                            self.screen_geo.left() + 120,
+                            self.screen_geo.right() - 120)
+        if self.perch is not None or self.air is not None:
+            if self.air is None:
+                self.brain.set_action(HOP_DOWN)
+            return
+        self.brain.set_action(CALLED)
+
     def _eat_files(self, paths: list[str]):
         appdir = os.path.normpath(APP_DIR).lower() + os.sep
         safe = [q for q in paths
@@ -1891,6 +2177,7 @@ class CatWidget(QWidget):
             self.emo.event(-0.05, 0.1)
             return
         self.st.files_eaten += len(safe)
+        self._bond_up(0.3)
         self.emo.event(0.2, 0.15)
         if self.dragging or self.brain.action in (DRAGGED, FALLING):
             self._bubble("heart", 2.0)
@@ -1924,6 +2211,7 @@ class CatWidget(QWidget):
     def brush(self):
         self.st.clean = clamp(self.st.clean + 40, 0, 100)
         self.st.social = clamp(self.st.social + 14, 0, 100)
+        self._bond_up(0.5)
         self.emo.event(0.3, -0.1)
         self._spawn_sparkles(9)
         self._bubble("heart", 2.0)
@@ -1939,6 +2227,7 @@ class CatWidget(QWidget):
                 gx = self.gift_item[0] - (self.world_x - self.W / 2)
                 if abs(ev.position().x() - gx) < 30 and ev.position().y() > self.GROUND - 40:
                     self.gift_item = None
+                    self._bond_up(0.4)
                     self._spawn_hearts(3)
                     self._spawn_sparkles(6)
                     self.emo.event(0.15, 0.05)
@@ -1973,6 +2262,7 @@ class CatWidget(QWidget):
                 if self.stroke_accum > 55:
                     self.stroke_accum = 0
                     self.st.social = clamp(self.st.social + 4.5, 0, 100)
+                    self._bond_up(0.12)
                     self.emo.event(0.07, -0.03)
                     self._spawn_hearts(1)
                     if self.rng.random() < 0.5:
@@ -2005,6 +2295,7 @@ class CatWidget(QWidget):
         elif self.press_pos is not None and self._cat_hit(ev.position()):
             if time.time() - self.press_t < 0.35 and not self.petting:
                 self.st.social = clamp(self.st.social + 2.0, 0, 100)
+                self._bond_up(0.05)
                 self.emo.event(0.05, 0.05)
                 self._spawn_hearts(1)
                 self._bubble("note", 1.4)
@@ -2013,15 +2304,24 @@ class CatWidget(QWidget):
 
     def contextMenuEvent(self, ev):
         menu = QMenu(self)
-        feed = menu.addMenu("Feed")
+        # a full cat refusing with a silent "?" reads as a bug — grey the
+        # food out instead and say why
+        full = self.st.hunger > 88
+        feed = menu.addMenu("Feed" + ("  (not hungry)" if full else ""))
         for name in FOODS:
             if name == "Trash":
                 continue
             fav = " ♥" if FOODS[name][3] else ""
-            feed.addAction(QAction(f"{name}{fav}", menu,
-                                   triggered=lambda _=False, n=name: self.feed(n)))
+            act = QAction(f"{name}{fav}", menu,
+                          triggered=lambda _=False, n=name: self.feed(n))
+            act.setEnabled(not full)
+            feed.addAction(act)
         menu.addAction(QAction("Play (chase your cursor)", menu, triggered=self.start_play))
         menu.addAction(QAction("Brush", menu, triggered=self.brush))
+        if self.sounds:
+            menu.addAction(QAction("Sounds", menu, checkable=True,
+                                   checked=not self.st.muted,
+                                   triggered=self.toggle_mute))
         menu.addSeparator()
         menu.addAction(QAction("Stats", menu, triggered=self.show_stats))
         menu.addAction(QAction("Rename…", menu, triggered=self.rename))
@@ -2233,6 +2533,19 @@ class CatWidget(QWidget):
             path.addRoundedRect(QRectF(-4, -16, 9, 12), 3, 3)
             path.addRoundedRect(QRectF(-8, -7, 13, 8), 4, 4)
             p.drawPath(path.simplified())
+        elif kind == "flower":
+            pen = QPen(QColor("#8FA678"), 2.2, Qt.PenStyle.SolidLine,
+                       Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.drawLine(QPointF(0, 0), QPointF(2, -7))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#E8919E"))
+            for k in range(5):
+                ang = k * 2 * math.pi / 5 - math.pi / 2
+                p.drawEllipse(QPointF(2 + math.cos(ang) * 5.5,
+                                      -12 + math.sin(ang) * 5.5), 4.0, 4.0)
+            p.setBrush(QColor("#F2C86B"))
+            p.drawEllipse(QPointF(2, -12), 3.0, 3.0)
         else:
             p.setBrush(QColor("#8A7A5C"))
             p.drawEllipse(QPointF(0, -5), 6, 4.5)
@@ -2246,7 +2559,7 @@ class StatsPopup(QWidget):
                          | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.cat = cat
-        self.resize(250, 296)
+        self.resize(250, 322)
         refresh = QTimer(self)
         refresh.timeout.connect(self.update)
         refresh.start(500)
@@ -2290,7 +2603,7 @@ class StatsPopup(QWidget):
 
         bars = [("Food", st.hunger, "#E8A87C"), ("Energy", st.energy, "#9BB8D3"),
                 ("Fun", st.fun, "#C9A9DD"), ("Love", st.social, "#F2A0B5"),
-                ("Clean", st.clean, "#9CCDB8")]
+                ("Clean", st.clean, "#9CCDB8"), ("Bond", st.bond, "#D9B36C")]
         by = y + 56
         for label, val, col in bars:
             p.setPen(QColor("#8A7E74"))
@@ -2349,25 +2662,52 @@ def toggle_autostart():
         pass
 
 
-def make_tray_icon() -> QIcon:
+def make_tray_icon(emotion: str = "calm") -> QIcon:
+    """The tray face is a mood ring: ears flatten when he's cross, eyes
+    close when he's content or asleep, narrow when he's grumpy."""
     img = QImage(64, 64, QImage.Format.Format_ARGB32)
     img.fill(Qt.GlobalColor.transparent)
     p = QPainter(img)
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     p.setPen(Qt.PenStyle.NoPen)
     p.setBrush(FUR)
+    ears_back = emotion in ("grumpy", "moody", "sad")
     for side in (-1, 1):
-        path = QPainterPath(QPointF(32 + side * 26, 30))
-        path.lineTo(QPointF(32 + side * 22, 4))
-        path.lineTo(QPointF(32 + side * 6, 16))
+        if ears_back:
+            path = QPainterPath(QPointF(32 + side * 26, 32))
+            path.lineTo(QPointF(32 + side * 31, 12))
+            path.lineTo(QPointF(32 + side * 8, 17))
+        else:
+            path = QPainterPath(QPointF(32 + side * 26, 30))
+            path.lineTo(QPointF(32 + side * 22, 4))
+            path.lineTo(QPointF(32 + side * 6, 16))
         path.closeSubpath()
         p.drawPath(path)
     p.drawEllipse(QPointF(32, 36), 27, 24)
-    p.setBrush(EYE)
-    p.drawEllipse(QPointF(22, 34), 3.6, 4.6)
-    p.drawEllipse(QPointF(42, 34), 3.6, 4.6)
+    if emotion in ("sleepy", "content"):
+        pen = QPen(EYE, 3.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for ex in (22, 42):
+            arc = QPainterPath(QPointF(ex - 5, 33))
+            arc.quadTo(QPointF(ex, 37.5), QPointF(ex + 5, 33))
+            p.drawPath(arc)
+        p.setPen(Qt.PenStyle.NoPen)
+    else:
+        p.setBrush(EYE)
+        ry = 2.6 if ears_back else 4.6
+        for ex in (22, 42):
+            p.drawEllipse(QPointF(ex, 34), 3.6, ry)
     p.setBrush(NOSE)
     p.drawEllipse(QPointF(32, 43), 3.4, 2.6)
+    if emotion in ("grumpy", "moody", "sad"):
+        pen = QPen(EYE, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        m = QPainterPath(QPointF(27, 52))
+        m.quadTo(QPointF(32, 49 if emotion == "sad" else 52), QPointF(37, 52))
+        p.drawPath(m)
+        p.setPen(Qt.PenStyle.NoPen)
     p.end()
     return QIcon(QPixmap.fromImage(img))
 
@@ -2439,7 +2779,8 @@ def simulate(hours: float):
     names = {v: k for k, v in globals().items()
              if k in ("IDLE_SIT", "LOAF", "SLEEP", "WALK", "GROOM", "WATCH",
                       "BEG", "ZOOMIES", "EAT", "PLAY", "DRAGGED", "FALLING",
-                      "GIFT", "STRETCH", "CHASE", "GO_PERCH", "HOP_DOWN")}
+                      "GIFT", "STRETCH", "CHASE", "GO_PERCH", "HOP_DOWN",
+                      "CALLED")}
     stretches = chases = perches = 0
     for i in range(n):
         sim_t = t0 + i * step
@@ -2475,7 +2816,7 @@ def simulate(hours: float):
         elif brain.action == CHASE:
             chases += 1
         assert -1 <= emo.valence <= 1 and -1 <= emo.arousal <= 1
-        for v in (st.hunger, st.energy, st.fun, st.social, st.clean):
+        for v in (st.hunger, st.energy, st.fun, st.social, st.clean, st.bond):
             assert 0 <= v <= 100
         if i % 120 == 0:
             print(f"h{i*step/3600:5.1f} clock={hour:4.1f} "
@@ -2526,8 +2867,9 @@ def main():
     if away_h > 4:
         cat._bubble("heart", 4.0)
         cat._spawn_hearts(4)
+        QTimer.singleShot(900, lambda: cat._play("meow"))
 
-    tray = QSystemTrayIcon(make_tray_icon())
+    tray = QSystemTrayIcon(make_tray_icon(cat.emo.emotion()))
     tray.setToolTip(st.name)
     cat.tray = tray
     tmenu = QMenu()
@@ -2537,8 +2879,16 @@ def main():
             continue
         feed.addAction(QAction(name, tmenu,
                                triggered=lambda _=False, n=name: cat.feed(n)))
+    feed.aboutToShow.connect(
+        lambda: [a.setEnabled(cat.st.hunger <= 88) for a in feed.actions()])
     tmenu.addAction(QAction("Play", tmenu, triggered=cat.start_play))
     tmenu.addAction(QAction("Brush", tmenu, triggered=cat.brush))
+    tmenu.addAction(QAction(f"Call {st.name}", tmenu, triggered=cat.call_over))
+    if cat.sounds:
+        snd = QAction("Sounds", tmenu, checkable=True, checked=not st.muted,
+                      triggered=cat.toggle_mute)
+        tmenu.addAction(snd)
+        tmenu.aboutToShow.connect(lambda: snd.setChecked(not cat.st.muted))
     tmenu.addAction(QAction("Stats", tmenu, triggered=cat.show_stats))
     tmenu.addSeparator()
     tmenu.addAction(QAction("Quit", tmenu, triggered=app.quit))

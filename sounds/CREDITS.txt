@@ -1,0 +1,6 @@
+Sound sources (all CC0 / public domain):
+- purr.wav: 'cat purring loop.wav' by soundofsong, https://freesound.org/s/650575/ (CC0), trimmed + loop-crossfaded
+- chirp.wav, chirp2.wav: cut from 'Cat trilling' by jsbarrett, https://freesound.org/s/200336/ (CC0)
+- meow.wav, meow2.wav: 'Little meow of a cat #1' by Joseph SARDIN, https://bigsoundbank.com/little-meow-of-a-cat-s0494.html (CC0); meow2 is pitch-shifted -4.5%
+
+Delete any of these and Mochi falls back to synthesizing purr/chirp/meow on next launch (ensure_sounds in pet.pyw).
