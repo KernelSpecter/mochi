@@ -11,4 +11,6 @@ works as a recycle bin, feed trash files to the cat.
 # Stats
 right click the cat and select stats to view its stats(hunger, happiness etc)
 
-(work in progress)
+![Project Screenshot](poses.png)
+
+# (work in progress)
