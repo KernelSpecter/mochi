@@ -13,4 +13,3 @@ right click the cat and select stats to view its stats(hunger, happiness etc)
 
 ![Project Screenshot](poses.png)
 
-# (work in progress)
