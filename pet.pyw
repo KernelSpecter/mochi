@@ -98,6 +98,16 @@ FOOD_COLORS = {
 
 SOUND_VOL = {"purr": 0.40, "chirp": 0.50, "meow": 0.50}
 
+RECENT_TAU = 900.0   # s — how far back the anti-repetition memory reaches
+REPEAT_PEN = 0.32    # max utility penalty for an action that monopolised it
+SWITCH_MARGIN = 0.20
+# The two knobs are deliberately independent: REPEAT_PEN sets how VARIED he is,
+# SWITCH_MARGIN sets how TWITCHY he is. The old flat `+0.18` bonus on the
+# incumbent conflated them, and since it exceeded most utilities' entire dynamic
+# range it became the decision-maker rather than a damper. A challenger must now
+# beat the incumbent outright, which is what keeps a hovering cursor from
+# strobing him between WATCH and LOAF. See redesign_v2.md §1.
+
 
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
@@ -291,18 +301,25 @@ def tick_needs(st: PetState, dt: float, action: int):
                       * (0.35 if sleeping else 1), 0, 100)
     st.fun = clamp(st.fun - dt / 3600 * (4.0 + 3.0 * st.playful)
                    * (0.2 if sleeping else 1), 0, 100)
+    # Restore rates are sized per BOUT, not per hour: one bout should be worth
+    # roughly half an hour of decay, so the behaviour recurs. At the old rates a
+    # single 12 s groom refilled 30 h of decay, which is why he groomed for ten
+    # minutes in a simulated week. Ceilings keep self-entertainment below owner
+    # play, or the boredom loop dies.
     if action == ZOOMIES:
-        st.fun = clamp(st.fun + dt * 0.5, 0, 100)
-    elif action == CHASE and st.fun < 65:
-        st.fun = clamp(st.fun + dt * 0.12, 0, 65)     # staves off boredom, but
-        # only real play with the owner gets fun above self-entertainment level
-    elif action in (WALK, PLAY):
+        st.fun = clamp(st.fun + dt * 0.35, 0, 80)
+    elif action == CHASE:
+        st.fun = clamp(st.fun + dt * 0.12, 0, 65)
+    elif action == WALK:
+        st.fun = clamp(st.fun + dt * 0.015, 0, 70)    # a stroll is mild relief;
+        # uncapped at 0.06 this alone pinned fun at 100 for the whole week
+    elif action == PLAY:
         st.fun = clamp(st.fun + dt * 0.06, 0, 100)
     st.social = clamp(st.social - dt / 3600 * (2.5 + 2.5 * st.needy)
                       * (0.3 if sleeping else 1), 0, 100)
-    st.clean = clamp(st.clean - dt / 3600 * 2.2, 0, 100)
+    st.clean = clamp(st.clean - dt / 3600 * 2.8, 0, 100)
     if action == GROOM:
-        st.clean = clamp(st.clean + dt * 0.55, 0, 100)
+        st.clean = clamp(st.clean + dt * 0.14, 0, 100)
     if sleeping:
         st.energy = clamp(st.energy + dt / 3600 * 30.0, 0, 100)
     else:
@@ -310,7 +327,9 @@ def tick_needs(st: PetState, dt: float, action: int):
             9.0 if action == CHASE else \
             6.0 if action in (WALK, PLAY, GO_PERCH, CALLED) else 3.2
         st.energy = clamp(st.energy - dt / 3600 * cost, 0, 100)
-    st.bond = clamp(st.bond - dt / 86400.0, 0, 100)   # trust fades ~1/day
+    # Trust fades faster the higher it is (~3.5/day at 100, ~1/day at 20), so a
+    # maxed bond is an equilibrium to keep up rather than a one-way latch
+    st.bond = clamp(st.bond - dt / 86400.0 * (0.5 + 0.03 * st.bond), 0, 100)
 
 
 class Brain:
@@ -328,6 +347,32 @@ class Brain:
         self.can_perch = False
         self.on_perch = False
         self.perch_minutes = 0.0
+        self.recent = {}          # action -> share of the last RECENT_TAU s
+        self.groom_urge = 0.0     # spikes on triggers, decays over ~2.5 min
+        self.last_u = {}          # last utility dict, for --histogram
+        self._last_choose = 0.0
+
+    def _tick_recent(self):
+        """Exponentially-decayed occupancy per action, ~= each action's share
+        of the last RECENT_TAU seconds. Derives its own dt from self.now() so
+        it works identically live and under --histogram with no extra call
+        site to keep in sync. Runs before choose()'s early returns so the
+        estimate stays honest while a reactive action holds the wheel."""
+        now = self.now()
+        if not self._last_choose:
+            self._last_choose = now
+            return
+        dt = clamp(now - self._last_choose, 0.0, 120.0)
+        self._last_choose = now
+        if dt <= 0:
+            return
+        self.groom_urge *= math.exp(-dt / 150.0)
+        k = math.exp(-dt / RECENT_TAU)
+        for a in list(self.recent):
+            self.recent[a] *= k
+            if self.recent[a] < 1e-4:
+                del self.recent[a]
+        self.recent[self.action] = self.recent.get(self.action, 0.0) + (1.0 - k)
 
     def user_idle_minutes(self) -> float:
         try:
@@ -344,6 +389,7 @@ class Brain:
 
     def choose(self, hour: float, cursor_active: bool, cursor_near: bool):
         st, emo = self.st, self.emo
+        self._tick_recent()
         if self.action in (DRAGGED, FALLING, EAT, PLAY, GIFT,
                            GO_PERCH, HOP_DOWN, CALLED):
             return self.action
@@ -353,33 +399,48 @@ class Brain:
         idle_min = self.user_idle_minutes()
         sleepy = emo.sleep_pressure(hour)
         awake_recently = (self.now() - self.woke_at) < 90
+        aro = max(0.0, emo.arousal)
+        rest_need = clamp((55 - st.energy) / 55.0, 0, 1)
+        exert = sum(self.recent.get(a, 0.0)      # WALK excluded — a stroll is
+                    for a in (ZOOMIES, CHASE, PLAY, GO_PERCH, CALLED))  # not tiring
 
         u = {}
-        u[IDLE_SIT] = 0.50
-        u[LOAF] = 0.52 + 0.35 * st.lazy - 0.25 * max(0, emo.arousal)
+        # IDLE_SIT has to earn its place — as a flat constant it never once won
+        # a decision, so it is now the post-exertion breather
+        u[IDLE_SIT] = 0.28 + 0.45 * clamp(exert * 1.6, 0, 1) + 0.18 * aro
+        u[LOAF] = 0.42 + 0.30 * st.lazy + 0.40 * rest_need - 0.35 * aro
         u[SLEEP] = (0.15 + 1.5 * sleepy + 0.25 * st.lazy
                     + (0.45 if idle_min > 6 else 0.0)
                     - (0.8 if awake_recently else 0.0)
-                    + (0.5 if self.action == SLEEP else 0.0))
-        u[WALK] = 0.32 + 0.55 * max(0.0, emo.arousal) + 0.25 * st.playful \
-            + (0.15 if st.fun < 45 else 0.0)
-        u[GROOM] = 0.15 + 1.05 * clamp((65 - st.clean) / 65.0, 0, 1) \
-            - 0.3 * max(0, emo.arousal)
-        u[WATCH] = (0.75 + 0.3 * st.playful) if cursor_active else 0.1
+                    + (0.5 if self.action == SLEEP else 0.0)
+                    # a fully-rested cat stops going back to bed. Without this
+                    # the self-bonus plus the idle bonus made SLEEP unbeatable
+                    # and he slept 80% of the week at energy 100
+                    - 0.18 * clamp((st.energy - 82) / 18.0, 0, 1))
+        u[WALK] = (0.30 + 0.55 * aro + 0.25 * st.playful
+                   + 0.35 * clamp((55 - st.fun) / 55.0, 0, 1))
+        # Grooming is trigger-driven, not need-driven. A smooth mid-range
+        # utility can never clear SWITCH_MARGIN against whatever he is already
+        # doing, which is why he groomed 0.3% of his waking life; real cats wash
+        # *after* something — a meal, a hand, a nap. The clean term is only a
+        # floor; groom_urge is what actually gets him to do it.
+        u[GROOM] = (0.26 + 0.55 * clamp((85 - st.clean) / 55.0, 0, 1) - 0.25 * aro
+                    + 0.92 * self.groom_urge
+                    + (0.25 if st.clean < 45 else 0.0))
+        u[WATCH] = (0.56 + 0.3 * st.playful) if cursor_active else 0.1
         if self.action == LOAF:
             u[WATCH] -= 0.5   # he watches from the loaf; no need to get up
-        u[BEG] = (1.35 * clamp((36 - st.hunger) / 36.0, 0, 1)
-                  + 0.25 * st.needy) if st.hunger < 42 else 0.0
+        u[BEG] = (1.35 * clamp((44 - st.hunger) / 44.0, 0, 1)
+                  + 0.25 * st.needy) if st.hunger < 50 else 0.0
         u[ZOOMIES] = 0.0
         if (emo.arousal > 0.5 and st.energy > 45 and not self.on_perch
                 and self.rng.random() < 0.06):
             u[ZOOMIES] = 2.5
-        if (st.social > 70 and emo.valence > 0.35 and st.gifts < 99
-                and not self.on_perch
+        if (st.social > 70 and emo.valence > 0.35 and not self.on_perch
                 and self.rng.random() < 0.004 + 0.012 * st.bond / 100.0):
             u[GIFT] = 2.2
         if self.chase_x is not None and st.energy > 25 and not self.on_perch:
-            u[CHASE] = 0.9 + 0.9 * st.playful + 0.4 * max(0.0, emo.arousal)
+            u[CHASE] = 0.9 + 0.9 * st.playful + 0.4 * aro
         if (self.can_perch and not self.on_perch and st.energy > 35
                 and self.rng.random() < 0.012):
             u[GO_PERCH] = 2.1
@@ -387,9 +448,20 @@ class Brain:
             u[HOP_DOWN] = (0.05 + 1.3 * clamp((36 - st.hunger) / 36.0, 0, 1)
                            + 0.03 * self.perch_minutes
                            + (0.6 if self.rng.random() < 0.01 else 0.0))
-        u[self.action] = u.get(self.action, 0) + 0.18  # hysteresis
+
+        # An action that has monopolised the last ~15 min gets progressively
+        # less appealing. SLEEP is exempt: a cat asleep for four hours is
+        # correct behaviour, not repetition.
+        for a in u:
+            if a != SLEEP:
+                u[a] -= REPEAT_PEN * clamp(self.recent.get(a, 0.0), 0, 1)
+        self.last_u = u
 
         best = max(u, key=u.get)
+        # commitment: a challenger has to win outright, not by a rounding error
+        if best != self.action and \
+                u[best] - u.get(self.action, -9.0) < SWITCH_MARGIN:
+            best = self.action
         if best != self.action:
             if self.action == SLEEP:
                 self.set_action(STRETCH)
@@ -400,11 +472,16 @@ class Brain:
     def set_action(self, a: int, min_dur: float | None = None):
         if self.action == SLEEP and a != SLEEP:
             self.woke_at = self.now()
+            self.groom_urge = clamp(self.groom_urge + 0.40, 0, 1.2)  # wash on waking
+        if self.action == EAT and a != EAT:
+            self.groom_urge = clamp(self.groom_urge + 0.9, 0, 1.2)   # wash after eating
         self.action = a
         self.action_t = 0.0
         self.walk_target = None
-        durs = {IDLE_SIT: (4, 10), LOAF: (8, 22), SLEEP: (120, 420),
-                WALK: (4, 9), GROOM: (6, 12), WATCH: (4, 9), BEG: (6, 12),
+        # Minimum dwell times also set the switching rate — variety must come
+        # from *which* action wins, not from cycling faster. See redesign_v2.md.
+        durs = {IDLE_SIT: (15, 35), LOAF: (30, 90), SLEEP: (120, 420),
+                WALK: (18, 45), GROOM: (20, 45), WATCH: (20, 50), BEG: (8, 16),
                 ZOOMIES: (4, 7), EAT: (900, 900), PLAY: (900, 900),
                 DRAGGED: (900, 900), FALLING: (900, 900), GIFT: (900, 900),
                 STRETCH: (2.0, 3.2), CHASE: (3, 6),
@@ -506,6 +583,27 @@ class CatPainter:
             c2 = QPointF(ox - 34 + wag * 6, oy - 52 - lift * 26)
             tip = QPointF(ox - 18 + wag * 14, oy - 66 - lift * 34)
             path.cubicTo(c1, c2, tip)
+        return path, tip
+
+    def _sit_tail_path(self, lift, wag):
+        """Sit tail: sweeps out beside him along the ground and hooks up, so its
+        LENGTH and ring markings are visible.
+
+        The shared `curl_front` curl showed only a blunt rounded stub past the
+        body edge, which reads as an arm hanging off his hip — user-reported
+        twice. Two traps behind that: (1) the exposed amount depends on body
+        width, and `wfat` shrinks with `weight`, so at the live weight (~0.89)
+        far more of it pokes out than at the DrawParams default of 1.0 — always
+        check art at the live state, not the defaults; (2) `_loaf` also calls
+        `curl_front`, so this is kept separate rather than editing that spline.
+
+        Stays above the ground plane and inside both the perch mask (+-115 px)
+        and `_cat_hit` (+-85 px) at scale 1.0.
+        """
+        ox, oy = 40, -16
+        tip = QPointF(ox + 32 + wag * 5, -16 - lift * 42)
+        path = QPainterPath(QPointF(ox - 6, oy))
+        path.cubicTo(QPointF(ox + 22, -9), QPointF(ox + 36, -8 - lift * 20), tip)
         return path, tip
 
     def _draw_tail(self, p, path, tip, width=15.0):
@@ -710,7 +808,10 @@ class CatPainter:
         wfat = 0.9 + 0.24 * (d.weight - 0.85) / 0.45
 
         wag = math.sin(d.tail_wag)
-        path, tip = self._tail_path(40, -16, d.tail_lift, wag, curl_front=True)
+        # tail_lift reaches 0.05 when arousal and valence are both low; keep a
+        # floor so the sweep always has some hook instead of lying dead flat
+        lift = 0.25 + 0.75 * d.tail_lift
+        path, tip = self._sit_tail_path(lift, wag)
         self._draw_tail(p, path, tip)
 
         body = QPainterPath()
@@ -2211,6 +2312,7 @@ class CatWidget(QWidget):
     def brush(self):
         self.st.clean = clamp(self.st.clean + 40, 0, 100)
         self.st.social = clamp(self.st.social + 14, 0, 100)
+        self.brain.groom_urge = clamp(self.brain.groom_urge + 0.7, 0, 1.2)
         self._bond_up(0.5)
         self.emo.event(0.3, -0.1)
         self._spawn_sparkles(9)
@@ -2712,8 +2814,40 @@ def make_tray_icon(emotion: str = "calm") -> QIcon:
     return QIcon(QPixmap.fromImage(img))
 
 
+def check_sit_tail() -> bool:
+    """The sit tail must stay above the ground plane (y=0) and inside the perch
+    mask (+-115 px) and `_cat_hit` (+-85 px). Sweeps the whole (tail_lift,
+    tail_wag) domain the emotion engine can reach.
+
+    Worth keeping: stills cannot settle either property. A few units of
+    ground overhang is indistinguishable from the soft shadow, which
+    legitimately extends below y=0, and how much of the tail is even exposed
+    depends on body width, which varies with `weight`. Measure, don't eyeball.
+    """
+    cp = CatPainter()
+    half = 15.0 * 0.5                   # _draw_tail stroke half-width / tip dot
+    low_worst, low_at, x_worst = -1e9, 0.0, 0.0
+    for i in range(21):
+        raw = 0.05 + 0.95 * i / 20.0
+        lift = 0.25 + 0.75 * raw        # must mirror _sit's floor
+        for j in range(25):
+            wag = math.sin(-math.pi + 2 * math.pi * j / 24.0)
+            path, tip = cp._sit_tail_path(lift, wag)
+            r = path.boundingRect()
+            low = max(r.bottom() + half, tip.y() + half)
+            if low > low_worst:
+                low_worst, low_at = low, raw
+            x_worst = max(x_worst, r.right() + half, tip.x() + half)
+    ok = low_worst <= 0.0 and x_worst <= 85.0
+    print(f"sit tail: {'PASS' if ok else 'FAIL'} — lowest y={low_worst:+.2f} "
+          f"(at tail_lift={low_at:.2f}, y>0 is under the floor), "
+          f"widest x={x_worst:.1f} (limit 85 = _cat_hit)")
+    return ok
+
+
 def snapshot(out_path: str):
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
+    check_sit_tail()
     painter_cat = CatPainter()
     cells = []
 
@@ -2829,6 +2963,134 @@ def simulate(hours: float):
           f"no assertion failures")
 
 
+def histogram(hours: float, seeded: bool = False, step: float = 1.0):
+    """Behavioural-range measurement — the counterpart to --simulate, which
+    checks that nothing breaks but says nothing about whether he is
+    *interesting*. Reports awake-normalised action shares (robust to the
+    away-from-keyboard model, unlike raw shares), switches/hour so added
+    variety can be told apart from flip-flopping, and the distribution of
+    every utility choose() computed."""
+    st = PetState()
+    if seeded and os.path.exists(SAVE_PATH):
+        raw = json.load(open(SAVE_PATH))
+        for k, v in raw.items():
+            if hasattr(st, k):
+                setattr(st, k, v)
+    emo = EmotionEngine(st)
+    brain = Brain(st, emo)
+    idle = [0.0]
+    brain.user_idle_minutes = lambda: idle[0]
+    rng = random.Random(7)
+    t0 = time.time()
+    n = int(hours * 3600 / step)
+    names = {v: k for k, v in globals().items()
+             if k in ("IDLE_SIT", "LOAF", "SLEEP", "WALK", "GROOM", "WATCH",
+                      "BEG", "ZOOMIES", "EAT", "PLAY", "DRAGGED", "FALLING",
+                      "GIFT", "STRETCH", "CHASE", "GO_PERCH", "HOP_DOWN",
+                      "CALLED")}
+    hist, switches, prev = {}, 0, brain.action
+    need_log = {k: [] for k in ("hunger", "energy", "fun", "social", "clean")}
+    util_log = {}
+    present, cursor, away_s = True, False, 0.0
+
+    for i in range(n):
+        sim_t = t0 + i * step
+        brain.now = (lambda t=sim_t: t)
+        lt = time.localtime(sim_t)
+        hour = lt.tm_hour + lt.tm_min / 60.0
+        tick_needs(st, step, brain.action)
+        emo.update(step, hour)
+        # The owner is modelled as an autocorrelated two-state process, NOT a
+        # per-step coin flip. WATCH's utility swings 0.09 <-> 0.91 on
+        # cursor_active, so an independent draw each step manufactures
+        # switching and turns the flip-flop guard into noise. (The live app
+        # smooths cursor_active with a 5 s hold for the same reason.)
+        if hour < 7.0 or hour > 23.5:
+            present, cursor = False, False
+        elif present:
+            if rng.random() < step / 3600.0 * 1.1:      # ~1.1 departures/hour
+                present, cursor = False, False
+        elif rng.random() < step / 3600.0 * 0.8:        # ~0.8 returns/hour
+            present = True
+        # mouse activity in runs: rates per second, not per step
+        p_stay, p_start = math.exp(-0.0025 * step), 0.004 * step
+        away_s = 0.0 if present else away_s + step
+        if present:
+            cursor = (rng.random() < p_stay) if cursor else (rng.random() < p_start)
+        idle[0] = 0.0 if present else away_s / 60.0
+        # Owner-event rates are PER SECOND (scaled by step) so they mean the
+        # same thing at any --step. Per-step constants silently scale 10x when
+        # the tick shrinks, which had a phantom 1.4 brushes/hour propping up
+        # `clean` and hiding the grooming deficit entirely.
+        if brain.action == BEG and rng.random() < 0.004 * step:
+            st.hunger = clamp(st.hunger + 50, 0, 100)
+            emo.event(0.35, 0.1)
+            brain.set_action(EAT)      # via EAT so the post-meal wash triggers
+        if present and rng.random() < 0.00004 * step:         # occasional brush
+            st.clean = clamp(st.clean + 40, 0, 100)
+            brain.groom_urge = clamp(brain.groom_urge + 0.7, 0, 1.2)
+        for a in (EAT, GIFT, CALLED):
+            if brain.action == a:
+                if a == GIFT:
+                    st.gifts += 1
+                brain.set_action(IDLE_SIT)
+        if present and rng.random() < 0.00016 * step:  # the owner pets him now+then
+            st.social = clamp(st.social + 25, 0, 100)
+            st.fun = clamp(st.fun + 8, 0, 100)
+            emo.event(0.45, 0.05)
+        if brain.chase_x is None and rng.random() < 0.00017 * step:
+            brain.chase_x = 500.0
+        elif brain.chase_x is not None and rng.random() < 0.005 * step:
+            brain.chase_x = None
+        brain.can_perch = not brain.on_perch
+        if brain.action == GO_PERCH:
+            brain.on_perch = True
+            brain.set_action(IDLE_SIT)
+        elif brain.action == HOP_DOWN:
+            brain.on_perch = False
+            brain.set_action(IDLE_SIT)
+        brain.perch_minutes += step / 60.0 if brain.on_perch else -brain.perch_minutes
+        brain.choose(hour, cursor_active=cursor, cursor_near=True)
+        brain.action_t += step
+        if brain.action != prev:
+            switches += 1
+            prev = brain.action
+        hist[brain.action] = hist.get(brain.action, 0) + 1
+        for k in need_log:
+            need_log[k].append(getattr(st, k))
+        for a, v in brain.last_u.items():
+            util_log.setdefault(a, []).append(v)
+
+    order = sorted(hist, key=lambda a: -hist[a])
+    awake = n - hist.get(SLEEP, 0)
+    rest = sum(hist.get(a, 0) for a in (IDLE_SIT, LOAF, SLEEP))
+    print(f"=== {hours:.0f} h @ {step:.0f}s steps, "
+          f"{'seeded from cat_state.json' if seeded else 'fresh state'} ===")
+    print(f"asleep {hist.get(SLEEP, 0)*100.0/n:.1f}%  (real cats: 50-67%)   "
+          f"rest incl. sit/loaf {rest*100.0/n:.1f}%")
+    # per WAKING hour: he cannot switch while asleep, so a raw per-hour rate
+    # silently improves whenever sleep share rises. This is the flip-flop guard.
+    print(f"switches/waking-hour {switches/max(awake*step/3600.0, 1e-9):.1f}   "
+          f"(pre-v2 baseline 85.7)   distinct actions {len(hist)}/18")
+    print("\n-- share of WAKING life (the honest metric) --")
+    for a in order:
+        if a == SLEEP:
+            continue
+        print(f"   {names.get(a, a):9s} {hist[a]*100.0/max(awake,1):5.1f}%")
+    print("\n-- utility spread (a flat row = an action that answers to nothing) --")
+    print(f"   {'action':9s} {'mean':>6s} {'p50':>6s} {'p95':>6s} {'range':>6s}")
+    for a in sorted(util_log, key=lambda a: -sum(util_log[a])/len(util_log[a])):
+        v = sorted(util_log[a])
+        m = sum(v) / len(v)
+        print(f"   {names.get(a, a):9s} {m:6.2f} {v[len(v)//2]:6.2f} "
+              f"{v[int(len(v)*.95)]:6.2f} {v[-1]-v[0]:6.2f}")
+    print("\n-- where each need actually lives --")
+    for k, arr in need_log.items():
+        v = sorted(arr)
+        print(f"   {k:7s} p05={v[int(len(v)*.05)]:5.1f} p50={v[len(v)//2]:5.1f} "
+              f"p95={v[int(len(v)*.95)]:5.1f}")
+
+
 def already_running() -> bool:
     """Single-instance guard via a named mutex (Windows)."""
     try:
@@ -2844,8 +3106,19 @@ def main():
     ap.add_argument("--snapshot", metavar="PNG", help="render pose grid and exit")
     ap.add_argument("--simulate", type=float, metavar="HOURS",
                     help="headless systems simulation")
+    ap.add_argument("--histogram", type=float, metavar="HOURS",
+                    help="headless behavioural-range measurement")
+    ap.add_argument("--seeded", action="store_true",
+                    help="--histogram starts from cat_state.json, not a fresh cat")
+    ap.add_argument("--step", type=float, default=1.0, metavar="SEC",
+                    help="--histogram tick, s. The live app calls choose() at "
+                         "1 Hz and the ZOOMIES/GO_PERCH/GIFT gates are PER-CALL "
+                         "probabilities, so only --step 1 gets their rates right")
     args = ap.parse_args()
 
+    if args.histogram:
+        histogram(args.histogram, seeded=args.seeded, step=args.step)
+        return
     if args.simulate:
         simulate(args.simulate)
         return
