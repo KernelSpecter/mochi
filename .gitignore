@@ -1,0 +1,4 @@
+__pycache__/
+cat_state.json
+cat_state.json.tmp
+out.png
